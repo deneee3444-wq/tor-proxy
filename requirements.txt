@@ -2,3 +2,4 @@ flask==3.0.3
 requests[socks]==2.32.3
 gunicorn==22.0.0
 stem==1.8.2
+beautifulsoup4==4.12.3
