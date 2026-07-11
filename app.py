@@ -13,6 +13,7 @@ TOR_PROXIES = {
 }
 
 TOR_CONTROL_PASSWORD = os.environ.get("TOR_CONTROL_PASSWORD", "changeme123")
+API_TOKEN = "mySecretToken123"  # buraya kendi gizli tokenini yaz
 
 
 def renew_tor_ip():
@@ -27,9 +28,19 @@ def renew_tor_ip():
 
 @app.route("/")
 def proxy():
+    print(
+        f"[REQUEST] ip={request.headers.get('X-Forwarded-For', request.remote_addr)} "
+        f"url={request.args.get('url')!r} new_ip={request.args.get('new_ip')!r} "
+        f"token_ok={not API_TOKEN or request.args.get('token') == API_TOKEN}",
+        flush=True,
+    )
+
+    if API_TOKEN and request.args.get("token") != API_TOKEN:
+        return "Unauthorized", 401
+
     url = request.args.get("url")
     if not url:
-        return "Kullanım: /?url=https://example.com&new_ip=1", 400
+        return "Kullanım: /?url=https://example.com&new_ip=1&token=...", 400
 
     if request.args.get("new_ip") == "1":
         try:
