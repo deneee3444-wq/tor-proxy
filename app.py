@@ -24,7 +24,6 @@ TOR_PROXIES = {
 TOR_CONTROL_PASSWORD = os.environ.get("TOR_CONTROL_PASSWORD", "changeme123")
 API_TOKEN = os.environ.get("API_TOKEN", "mySecretToken123")
 
-# Cloudflare WebSocket doğrulaması için gerekli SSL şifreleme paketleri
 SSL_CIPHERS = (
     "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
     "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
@@ -50,7 +49,6 @@ SKIP_SCHEMES = ("javascript:", "mailto:", "data:", "tel:", "#")
 
 
 def renew_tor_ip():
-    """Tor'a NEWNYM sinyali gönderip yeni bir devre (yeni çıkış IP'si) talep eder."""
     with Controller.from_port(port=9051) as controller:
         controller.authenticate(password=TOR_CONTROL_PASSWORD)
         controller.signal(Signal.NEWNYM)
@@ -175,16 +173,13 @@ def browse():
 @app.route("/", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 @app.route("/proxy", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 def proxy():
-    """Tüm HTTP/HTTPS isteklerini (GET, POST, Header, Cookie ve JSON dahil) Tor üzerinden iletir."""
+    """Tüm HTTP/HTTPS isteklerini Tor üzerinden iletir."""
     if request.args.get("token") != API_TOKEN:
         return "Unauthorized", 401
 
     url = request.args.get("url")
     if not url:
-        return (
-            "Kullanim: /?url=https://example.com&new_ip=1&token=... (tam site gezmek icin /browse kullan)",
-            400,
-        )
+        return "Kullanim: /?url=https://example.com&new_ip=1&token=...", 400
 
     if request.args.get("new_ip") == "1":
         try:
@@ -192,7 +187,6 @@ def proxy():
         except Exception as e:
             return f"Yeni IP alinamadi: {e}", 502
 
-    # İstemciden gelen başlıkları (headers) upstream hedefe eksiksiz aktar
     hop_by_hop = {
         "host",
         "connection",
@@ -236,7 +230,7 @@ def proxy():
 
 @sock.route("/ws")
 def ws_proxy(client_ws):
-    """Gelen WebSocket isteklerini Tor üzerinden hedef WSS sunucusuna köprüler."""
+    """Gelen WebSocket isteklerini Tor üzerinden UseAI sunucusuna köprüler."""
     if request.args.get("token") != API_TOKEN:
         client_ws.close(1008, "Unauthorized")
         return
@@ -246,15 +240,17 @@ def ws_proxy(client_ws):
         client_ws.close(1002, "Missing url")
         return
 
-    # UseAI'ın Cloudflare koruması için zorunlu olan HTTP başlıkları
     extra_headers = [
         "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language: tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cache-Control: no-cache",
         "Pragma: no-cache",
     ]
-    if "Cookie" in request.headers:
-        extra_headers.append(f"Cookie: {request.headers['Cookie']}")
+
+    # Cloudflare başlığı sildiği için hem URL'deki cookies parametresini hem de başlığı kontrol et
+    cookie_str = request.args.get("cookies") or request.headers.get("Cookie")
+    if cookie_str:
+        extra_headers.append(f"Cookie: {cookie_str}")
 
     try:
         ssl_ctx = ssl.create_default_context()
@@ -281,7 +277,7 @@ def ws_proxy(client_ws):
         try:
             while active:
                 data = upstream_ws.recv()
-                if data is None:
+                if not data:
                     break
                 client_ws.send(data)
         except Exception:
@@ -298,10 +294,10 @@ def ws_proxy(client_ws):
 
     try:
         while active:
-            data = client_ws.receive()
-            if data is None:
-                break
-            upstream_ws.send(data)
+            # 0.5s timeout ile dinle, kilitlenmeyi önle
+            data = client_ws.receive(timeout=0.5)
+            if data:
+                upstream_ws.send(data)
     except Exception:
         pass
     finally:
