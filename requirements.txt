@@ -3,3 +3,6 @@ requests[socks]==2.32.3
 gunicorn==22.0.0
 stem==1.8.2
 beautifulsoup4==4.12.3
+flask-sock==0.7.0
+websocket-client==1.8.0
+python-socks==3.1.1
