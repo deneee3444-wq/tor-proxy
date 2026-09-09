@@ -1,5 +1,6 @@
 import os
 import re
+import ssl
 import time
 import uuid
 import threading
@@ -23,18 +24,33 @@ TOR_PROXIES = {
 TOR_CONTROL_PASSWORD = os.environ.get("TOR_CONTROL_PASSWORD", "changeme123")
 API_TOKEN = os.environ.get("API_TOKEN", "mySecretToken123")
 
+# Cloudflare WebSocket doğrulaması için gerekli SSL şifreleme paketleri
+SSL_CIPHERS = (
+    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+    "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
+)
+
 SESSIONS = {}
 
 REWRITE_ATTRS = [
-    ("a", "href"), ("link", "href"), ("script", "src"), ("img", "src"),
-    ("source", "src"), ("iframe", "src"), ("video", "src"), ("audio", "src"),
-    ("embed", "src"), ("form", "action"),
+    ("a", "href"),
+    ("link", "href"),
+    ("script", "src"),
+    ("img", "src"),
+    ("source", "src"),
+    ("iframe", "src"),
+    ("video", "src"),
+    ("audio", "src"),
+    ("embed", "src"),
+    ("form", "action"),
 ]
 CSS_URL_RE = re.compile(r"url\((['\"]?)(.*?)\1\)")
 SKIP_SCHEMES = ("javascript:", "mailto:", "data:", "tel:", "#")
 
 
 def renew_tor_ip():
+    """Tor'a NEWNYM sinyali gönderip yeni bir devre (yeni çıkış IP'si) talep eder."""
     with Controller.from_port(port=9051) as controller:
         controller.authenticate(password=TOR_CONTROL_PASSWORD)
         controller.signal(Signal.NEWNYM)
@@ -93,7 +109,12 @@ def rewrite_html(html, base_url):
         content = el.get("content", "")
         m = re.search(r"url=(.+)", content, re.I)
         if m:
-            el["content"] = re.sub(r"url=.+", f"url={proxy_link(urljoin(base_url, m.group(1).strip()))}", content, flags=re.I)
+            el["content"] = re.sub(
+                r"url=.+",
+                f"url={proxy_link(urljoin(base_url, m.group(1).strip()))}",
+                content,
+                flags=re.I,
+            )
 
     for el in soup.find_all("base"):
         el.decompose()
@@ -118,10 +139,19 @@ def browse():
         return "Kullanim: /browse?url=https://example.com&token=...", 400
 
     sid, sess = get_session()
-    common_kwargs = dict(proxies=TOR_PROXIES, timeout=30, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+    common_kwargs = dict(
+        proxies=TOR_PROXIES,
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0"},
+        allow_redirects=True,
+    )
 
     try:
-        upstream = sess.post(url, data=request.form, **common_kwargs) if request.method == "POST" else sess.get(url, **common_kwargs)
+        upstream = (
+            sess.post(url, data=request.form, **common_kwargs)
+            if request.method == "POST"
+            else sess.get(url, **common_kwargs)
+        )
     except requests.exceptions.RequestException as e:
         return f"Tor uzerinden istek basarisiz: {e}", 502
 
@@ -151,7 +181,10 @@ def proxy():
 
     url = request.args.get("url")
     if not url:
-        return "Kullanim: /?url=https://example.com&new_ip=1&token=...", 400
+        return (
+            "Kullanim: /?url=https://example.com&new_ip=1&token=... (tam site gezmek icin /browse kullan)",
+            400,
+        )
 
     if request.args.get("new_ip") == "1":
         try:
@@ -159,9 +192,21 @@ def proxy():
         except Exception as e:
             return f"Yeni IP alinamadi: {e}", 502
 
-    # İstemciden gelen başlıkları (headers) upstream hedefe aktar
-    hop_by_hop = {"host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"}
-    forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop}
+    # İstemciden gelen başlıkları (headers) upstream hedefe eksiksiz aktar
+    hop_by_hop = {
+        "host",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+    forward_headers = {
+        k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop
+    }
     forward_headers["Host"] = urlparse(url).netloc
 
     try:
@@ -179,8 +224,14 @@ def proxy():
         return f"Tor uzerinden istek basarisiz: {e}", 502
 
     excluded_headers = {"content-encoding", "transfer-encoding", "connection"}
-    resp_headers = [(k, v) for k, v in upstream.headers.items() if k.lower() not in excluded_headers]
-    return Response(upstream.content, status=upstream.status_code, headers=resp_headers)
+    resp_headers = [
+        (k, v)
+        for k, v in upstream.headers.items()
+        if k.lower() not in excluded_headers
+    ]
+    return Response(
+        upstream.content, status=upstream.status_code, headers=resp_headers
+    )
 
 
 @sock.route("/ws")
@@ -195,21 +246,31 @@ def ws_proxy(client_ws):
         client_ws.close(1002, "Missing url")
         return
 
-    extra_headers = []
-    for h in ["Origin", "User-Agent", "Cookie"]:
-        if h in request.headers:
-            extra_headers.append(f"{h}: {request.headers[h]}")
+    # UseAI'ın Cloudflare koruması için zorunlu olan HTTP başlıkları
+    extra_headers = [
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language: tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control: no-cache",
+        "Pragma: no-cache",
+    ]
+    if "Cookie" in request.headers:
+        extra_headers.append(f"Cookie: {request.headers['Cookie']}")
 
     try:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.set_ciphers(SSL_CIPHERS)
         upstream_ws = ws_client.create_connection(
             target_url,
-            header=extra_headers if extra_headers else None,
+            origin="https://use.ai",
+            sslopt={"context": ssl_ctx},
+            header=extra_headers,
             http_proxy_host="127.0.0.1",
             http_proxy_port=9050,
             proxy_type="socks5h",
             timeout=30,
         )
     except Exception as e:
+        print(f"[WS ERROR] Upstream baglanti hatasi: {e}", flush=True)
         client_ws.close(1011, f"Upstream error: {e}")
         return
 
