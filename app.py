@@ -2,14 +2,18 @@ import os
 import re
 import time
 import uuid
+import threading
+from urllib.parse import urljoin, quote, urlparse
 import requests
-from urllib.parse import urljoin, quote
 from flask import Flask, request, Response, make_response
+from flask_sock import Sock
+import websocket as ws_client
 from bs4 import BeautifulSoup
 from stem import Signal
 from stem.control import Controller
 
 app = Flask(__name__)
+sock = Sock(app)
 
 TOR_PROXIES = {
     "http": "socks5h://127.0.0.1:9050",
@@ -17,30 +21,20 @@ TOR_PROXIES = {
 }
 
 TOR_CONTROL_PASSWORD = os.environ.get("TOR_CONTROL_PASSWORD", "changeme123")
-API_TOKEN = "mySecretToken123"  # buraya kendi gizli tokenini yaz
+API_TOKEN = os.environ.get("API_TOKEN", "mySecretToken123")
 
-# session_id -> requests.Session (hedef sitenin cookie/oturum bilgisini taşımak icin)
 SESSIONS = {}
 
 REWRITE_ATTRS = [
-    ("a", "href"),
-    ("link", "href"),
-    ("script", "src"),
-    ("img", "src"),
-    ("source", "src"),
-    ("iframe", "src"),
-    ("video", "src"),
-    ("audio", "src"),
-    ("embed", "src"),
-    ("form", "action"),
+    ("a", "href"), ("link", "href"), ("script", "src"), ("img", "src"),
+    ("source", "src"), ("iframe", "src"), ("video", "src"), ("audio", "src"),
+    ("embed", "src"), ("form", "action"),
 ]
-
 CSS_URL_RE = re.compile(r"url\((['\"]?)(.*?)\1\)")
 SKIP_SCHEMES = ("javascript:", "mailto:", "data:", "tel:", "#")
 
 
 def renew_tor_ip():
-    """Tor'a NEWNYM sinyali gonderip yeni bir devre (yeni cikis IP'si) ister."""
     with Controller.from_port(port=9051) as controller:
         controller.authenticate(password=TOR_CONTROL_PASSWORD)
         controller.signal(Signal.NEWNYM)
@@ -50,8 +44,6 @@ def renew_tor_ip():
 
 
 def get_session():
-    """Her tarayici icin ayri bir requests.Session tutar, boylece hedef sitenin
-    login/cookie/session bilgisi istekler arasinda korunur."""
     sid = request.cookies.get("psid")
     if not sid or sid not in SESSIONS:
         sid = uuid.uuid4().hex
@@ -65,16 +57,13 @@ def proxy_link(absolute_url):
 
 def rewrite_html(html, base_url):
     soup = BeautifulSoup(html, "html.parser")
-
     for tag_name, attr in REWRITE_ATTRS:
         for el in soup.find_all(tag_name):
             val = el.get(attr)
             if not val or val.startswith(SKIP_SCHEMES):
                 continue
-            absolute = urljoin(base_url, val)
-            el[attr] = proxy_link(absolute)
+            el[attr] = proxy_link(urljoin(base_url, val))
 
-    # srcset: birden fazla url virgulle ayrilmis olabilir (img/source)
     for el in soup.find_all(["img", "source"]):
         if el.get("srcset"):
             parts = []
@@ -85,14 +74,12 @@ def rewrite_html(html, base_url):
                 parts.append(" ".join(bits))
             el["srcset"] = ", ".join(parts)
 
-    # inline style="...url(...)..."
     for el in soup.find_all(style=True):
         el["style"] = CSS_URL_RE.sub(
             lambda m: f"url({m.group(1)}{proxy_link(urljoin(base_url, m.group(2)))}{m.group(1)})",
             el["style"],
         )
 
-    # <style>...</style> bloklari
     for el in soup.find_all("style"):
         if el.string:
             el.string.replace_with(
@@ -102,15 +89,12 @@ def rewrite_html(html, base_url):
                 )
             )
 
-    # meta refresh yonlendirmesi
     for el in soup.find_all("meta", attrs={"http-equiv": re.compile("refresh", re.I)}):
         content = el.get("content", "")
         m = re.search(r"url=(.+)", content, re.I)
         if m:
-            absolute = urljoin(base_url, m.group(1).strip())
-            el["content"] = re.sub(r"url=.+", f"url={proxy_link(absolute)}", content, flags=re.I)
+            el["content"] = re.sub(r"url=.+", f"url={proxy_link(urljoin(base_url, m.group(1).strip()))}", content, flags=re.I)
 
-    # base tag'i kaldiriyoruz; linkleri zaten kendimiz mutlaklastirdik
     for el in soup.find_all("base"):
         el.decompose()
 
@@ -134,31 +118,20 @@ def browse():
         return "Kullanim: /browse?url=https://example.com&token=...", 400
 
     sid, sess = get_session()
-
-    common_kwargs = dict(
-        proxies=TOR_PROXIES,
-        timeout=30,
-        headers={"User-Agent": "Mozilla/5.0"},
-        allow_redirects=True,
-    )
+    common_kwargs = dict(proxies=TOR_PROXIES, timeout=30, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
 
     try:
-        if request.method == "POST":
-            upstream = sess.post(url, data=request.form, **common_kwargs)
-        else:
-            upstream = sess.get(url, **common_kwargs)
+        upstream = sess.post(url, data=request.form, **common_kwargs) if request.method == "POST" else sess.get(url, **common_kwargs)
     except requests.exceptions.RequestException as e:
         return f"Tor uzerinden istek basarisiz: {e}", 502
 
     content_type = upstream.headers.get("Content-Type", "")
-    final_url = upstream.url  # redirect sonrasi gercek adres
-
     if "text/html" in content_type:
-        body = rewrite_html(upstream.text, final_url)
+        body = rewrite_html(upstream.text, upstream.url)
         resp = make_response(body)
         resp.headers["Content-Type"] = "text/html; charset=utf-8"
     elif "text/css" in content_type:
-        body = rewrite_css(upstream.text, final_url)
+        body = rewrite_css(upstream.text, upstream.url)
         resp = make_response(body)
         resp.headers["Content-Type"] = "text/css; charset=utf-8"
     else:
@@ -169,22 +142,16 @@ def browse():
     return resp
 
 
-@app.route("/")
+@app.route("/", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+@app.route("/proxy", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 def proxy():
-    """Ham API/JSON cekmek icin basit endpoint (rewriting yapmaz)."""
-    print(
-        f"[REQUEST] ip={request.headers.get('X-Forwarded-For', request.remote_addr)} "
-        f"url={request.args.get('url')!r} new_ip={request.args.get('new_ip')!r} "
-        f"token_ok={request.args.get('token') == API_TOKEN}",
-        flush=True,
-    )
-
+    """Tüm HTTP/HTTPS isteklerini (GET, POST, Header, Cookie ve JSON dahil) Tor üzerinden iletir."""
     if request.args.get("token") != API_TOKEN:
         return "Unauthorized", 401
 
     url = request.args.get("url")
     if not url:
-        return "Kullanim: /?url=https://example.com&new_ip=1&token=...  (tam site gezmek icin /browse kullan)", 400
+        return "Kullanim: /?url=https://example.com&new_ip=1&token=...", 400
 
     if request.args.get("new_ip") == "1":
         try:
@@ -192,20 +159,97 @@ def proxy():
         except Exception as e:
             return f"Yeni IP alinamadi: {e}", 502
 
+    # İstemciden gelen başlıkları (headers) upstream hedefe aktar
+    hop_by_hop = {"host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"}
+    forward_headers = {k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop}
+    forward_headers["Host"] = urlparse(url).netloc
+
     try:
-        upstream = requests.get(
-            url, proxies=TOR_PROXIES, timeout=30,
-            headers={"User-Agent": "Mozilla/5.0"},
+        upstream = requests.request(
+            method=request.method,
+            url=url,
+            headers=forward_headers,
+            data=request.get_data(),
+            cookies=request.cookies,
+            proxies=TOR_PROXIES,
+            timeout=60,
+            allow_redirects=False,
         )
     except requests.exceptions.RequestException as e:
         return f"Tor uzerinden istek basarisiz: {e}", 502
 
     excluded_headers = {"content-encoding", "transfer-encoding", "connection"}
-    headers = [
-        (k, v) for k, v in upstream.headers.items()
-        if k.lower() not in excluded_headers
-    ]
-    return Response(upstream.content, status=upstream.status_code, headers=headers)
+    resp_headers = [(k, v) for k, v in upstream.headers.items() if k.lower() not in excluded_headers]
+    return Response(upstream.content, status=upstream.status_code, headers=resp_headers)
+
+
+@sock.route("/ws")
+def ws_proxy(client_ws):
+    """Gelen WebSocket isteklerini Tor üzerinden hedef WSS sunucusuna köprüler."""
+    if request.args.get("token") != API_TOKEN:
+        client_ws.close(1008, "Unauthorized")
+        return
+
+    target_url = request.args.get("url")
+    if not target_url:
+        client_ws.close(1002, "Missing url")
+        return
+
+    extra_headers = []
+    for h in ["Origin", "User-Agent", "Cookie"]:
+        if h in request.headers:
+            extra_headers.append(f"{h}: {request.headers[h]}")
+
+    try:
+        upstream_ws = ws_client.create_connection(
+            target_url,
+            header=extra_headers if extra_headers else None,
+            http_proxy_host="127.0.0.1",
+            http_proxy_port=9050,
+            proxy_type="socks5h",
+            timeout=30,
+        )
+    except Exception as e:
+        client_ws.close(1011, f"Upstream error: {e}")
+        return
+
+    active = True
+
+    def upstream_to_client():
+        nonlocal active
+        try:
+            while active:
+                data = upstream_ws.recv()
+                if data is None:
+                    break
+                client_ws.send(data)
+        except Exception:
+            pass
+        finally:
+            active = False
+            try:
+                client_ws.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=upstream_to_client, daemon=True)
+    t.start()
+
+    try:
+        while active:
+            data = client_ws.receive()
+            if data is None:
+                break
+            upstream_ws.send(data)
+    except Exception:
+        pass
+    finally:
+        active = False
+        try:
+            upstream_ws.close()
+        except Exception:
+            pass
+        t.join(timeout=2)
 
 
 @app.route("/health")
